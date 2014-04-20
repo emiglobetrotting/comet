@@ -14,17 +14,44 @@
 #include <getopt.h>
 #include <sys/queue.h>
 #include "config.h"
+#include "city.h"
+
+struct channel;
 
 struct connection {
   const char *callback;
   struct evhttp_request *req;
+  struct channel *channel;
+
   TAILQ_ENTRY(connection) next;
 };
 
-TAILQ_HEAD(,connection) connections;
+struct channel {
+  char *name;
+  uint64_t hash;
+  uint length;
+  
+  TAILQ_HEAD(,connection) connections;
+
+  TAILQ_ENTRY(channel) next;
+};
+
+TAILQ_HEAD(,channel) channels;
 
 struct evhttp_bound_socket *handle;
 int verbose = 0;
+
+struct channel* get_channel(uint64_t hash) {
+    struct channel *channel; 
+
+    TAILQ_FOREACH(channel, &channels, next) {
+      if (channel->hash == hash) {
+        return channel;
+      }
+    }
+
+    return NULL;
+}
 
 int get_int(struct evkeyvalq *params, const char *name, int def)
 {
@@ -40,9 +67,21 @@ const char* get_str(struct evkeyvalq *params, const char *name, const char *def)
 
 static void close(struct connection *connection)
 {
+  if (connection->req->evcon) {
+    evhttp_connection_set_closecb(connection->req->evcon, NULL, NULL);
+  }
+
   evhttp_send_reply_end(connection->req);
 
-  TAILQ_REMOVE(&connections, connection, next);
+  TAILQ_REMOVE(&connection->channel->connections, connection, next);
+
+  if (connection->channel->length == 1) {
+    TAILQ_REMOVE(&channels, connection->channel, next);
+    free(connection->channel->name);
+    free(connection->channel);
+  } else {
+    connection->channel->length--;
+  }
 
   free(connection);
 }
@@ -51,7 +90,8 @@ static void disconnect_cb(struct evhttp_connection *conn, void *arg)
 {
   struct connection *connection = (struct connection *)arg;
 
-  printf("disconnected %p\n", connection);
+  if (verbose)
+    fprintf(stderr, "disconnected %p\n", connection);
 
   close(connection);
 }
@@ -68,11 +108,38 @@ static void pub_handler(struct evhttp_request *req, void *arg)
     return;
   }
 
-  struct connection *connection;
   struct evbuffer *buf;
 
-  TAILQ_FOREACH(connection, &connections, next) {
-    printf("notify %p\n", connection->req->evcon);
+  struct evkeyvalq params;
+  evhttp_parse_query(ruri, &params);
+
+  const char *name = get_str(&params, "channel", NULL);
+  if (name == NULL || strlen(name) == 0) {
+    evhttp_send_reply(req, HTTP_BADREQUEST, "Invalid Request", NULL);
+
+    evhttp_clear_headers(&params);
+    return;
+  }
+
+  uint64_t hash = CityHash64(name, strlen(name));
+  struct channel *channel = get_channel(hash);
+  if (channel == NULL) {
+    buf = evbuffer_new();
+    evbuffer_add_printf(buf, "{sent: 0}\n");
+    evhttp_send_reply(req, HTTP_OK, "OK", buf);
+    evbuffer_free(buf);
+
+    evhttp_clear_headers(&params);
+    return;
+  }
+
+  uint length = channel->length;
+
+  struct connection *connection;
+  TAILQ_FOREACH(connection, &channel->connections, next) {
+    
+    if (verbose)
+      fprintf(stderr, "notify %p\n", connection->req->evcon);
 
     buf = evbuffer_new();
     if (connection->callback) {
@@ -85,20 +152,22 @@ static void pub_handler(struct evhttp_request *req, void *arg)
     evbuffer_add_printf(buf, "\n");
 
     evhttp_send_reply_chunk(connection->req, buf);
-    evhttp_send_reply_end(connection->req);
 
     evbuffer_free(buf);
 
     close(connection);
   }
 
+  evhttp_add_header(req->output_headers, "Content-Type", "text/json; charset=utf-8");
   evhttp_add_header(req->output_headers, "Access-Control-Allow-Origin", "*");
   evhttp_add_header(req->output_headers, "Access-Control-Allow-Methods", "GET,POST");
 
   buf = evbuffer_new();
-  evbuffer_add_printf(buf, "{status: true}\n");
+  evbuffer_add_printf(buf, "{sent: %d}\n", length);
   evhttp_send_reply(req, HTTP_OK, "OK", buf);
   evbuffer_free(buf);
+
+  evhttp_clear_headers(&params);
 }
 
 static void sub_handler(struct evhttp_request *req, void *arg)
@@ -116,11 +185,31 @@ static void sub_handler(struct evhttp_request *req, void *arg)
   struct evkeyvalq params;
   evhttp_parse_query(ruri, &params);
 
+  const char *name = get_str(&params, "channel", NULL);
+  if (name == NULL || strlen(name) == 0) {
+    evhttp_send_reply(req, HTTP_BADREQUEST, "Invalid Request", NULL);
+    return;
+  }
+
+  uint64_t hash = CityHash64(name, strlen(name));
+  struct channel *channel = get_channel(hash);
+  if (channel == NULL) {
+    channel = (struct channel *) calloc(1, sizeof *channel);
+    channel->length = 0;
+    channel->name = strdup(name);
+    channel->hash = hash;
+    TAILQ_INIT(&channel->connections);
+    TAILQ_INSERT_TAIL(&channels, channel, next);
+  }
+
   struct connection *connection;
   connection = (struct connection *) calloc(1, sizeof *connection);
-  TAILQ_INSERT_TAIL(&connections, connection, next);
   connection->req = req;
   connection->callback = get_str(&params, "callback", NULL);
+  connection->channel = channel;
+
+  channel->length++;
+  TAILQ_INSERT_TAIL(&channel->connections, connection, next);
 
   struct bufferevent * bufev = evhttp_connection_get_bufferevent(req->evcon);
   bufferevent_enable(bufev, EV_READ);
@@ -134,7 +223,8 @@ static void sub_handler(struct evhttp_request *req, void *arg)
 
   evhttp_clear_headers(&params);
 
-  printf("connected %p\n", connection->req->evcon);
+  if (verbose)
+    fprintf(stderr, "connected %p\n", connection->req->evcon);
 }
 
 static void gen_handler(struct evhttp_request *req, void *arg)
@@ -163,7 +253,7 @@ static void sighup_cb(evutil_socket_t sig, short events, void *ptr)
 
 int main (int argc, char *argv[])
 {
-  char *address = "0.0.0.0";
+  const char *address = "0.0.0.0";
   int port = 8080;
   struct event_base *base;
   struct evhttp *server;
@@ -188,7 +278,7 @@ int main (int argc, char *argv[])
     }
   }
 
-  TAILQ_INIT(&connections);
+  TAILQ_INIT(&channels);
 
   base = event_base_new();
 
