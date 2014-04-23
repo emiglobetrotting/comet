@@ -84,8 +84,6 @@ static void stat_handler(struct evhttp_request *req, void *arg)
   struct evbuffer *buf;
 
   evhttp_add_header(req->output_headers, "Content-Type", "text/json; charset=utf-8");
-  evhttp_add_header(req->output_headers, "Access-Control-Allow-Origin", "*");
-  evhttp_add_header(req->output_headers, "Access-Control-Allow-Methods", "GET,POST");
 
   buf = evbuffer_new();
   evbuffer_add_printf(buf, "{publication: %" PRIu64 ",", stats.publication);
@@ -138,6 +136,15 @@ static void pub_handler(struct evhttp_request *req, void *arg)
     return;
   }
 
+  const char *message = get_str(&params, "message", NULL);
+  if (message == NULL || strlen(message) == 0) {
+    evhttp_send_reply(req, HTTP_BADREQUEST, "Invalid Request", NULL);
+
+    evhttp_clear_headers(&params);
+    stats.invalid_request++;
+    return;
+  }
+
   uint64_t hash = CityHash64(name, strlen(name));
   struct channel *channel = get_channel(hash);
   if (channel == NULL) {
@@ -162,7 +169,7 @@ static void pub_handler(struct evhttp_request *req, void *arg)
     if (connection->callback) {
       evbuffer_add_printf(buf, "%s(", connection->callback);
     } 
-    evbuffer_add_printf(buf, "{content: \"%s\"}", "X");
+    evbuffer_add_printf(buf, "%s", message);
     if (connection->callback) {
       evbuffer_add_printf(buf, ");");
     }
@@ -177,8 +184,6 @@ static void pub_handler(struct evhttp_request *req, void *arg)
   }
 
   evhttp_add_header(req->output_headers, "Content-Type", "text/json; charset=utf-8");
-  evhttp_add_header(req->output_headers, "Access-Control-Allow-Origin", "*");
-  evhttp_add_header(req->output_headers, "Access-Control-Allow-Methods", "GET,POST");
 
   buf = evbuffer_new();
   evbuffer_add_printf(buf, "{sent: %d}\n", length);
