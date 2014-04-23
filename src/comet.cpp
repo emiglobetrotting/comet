@@ -12,32 +12,12 @@
 #include <event2/keyvalq_struct.h>
 #include <signal.h>
 #include <getopt.h>
-#include <sys/queue.h>
+#include <arpa/inet.h>
+#include "comet.h"
 #include "config.h"
 #include "city.h"
 
-struct channel;
-
-struct connection {
-  const char *callback;
-  struct evhttp_request *req;
-  struct channel *channel;
-
-  TAILQ_ENTRY(connection) next;
-};
-
-struct channel {
-  char *name;
-  uint64_t hash;
-  uint length;
-  
-  TAILQ_HEAD(,connection) connections;
-
-  TAILQ_ENTRY(channel) next;
-};
-
-TAILQ_HEAD(,channel) channels;
-
+struct stat stats;
 struct evhttp_bound_socket *handle;
 int verbose = 0;
 
@@ -51,18 +31,6 @@ struct channel* get_channel(uint64_t hash) {
     }
 
     return NULL;
-}
-
-int get_int(struct evkeyvalq *params, const char *name, int def)
-{
-  const char *val = evhttp_find_header(params, name);
-  return val ? atoi(val) : def;
-}
-
-const char* get_str(struct evkeyvalq *params, const char *name, const char *def)
-{
-  const char *val = evhttp_find_header(params, name);
-  return val ? val : def;
 }
 
 static void close(struct connection *connection)
@@ -84,6 +52,7 @@ static void close(struct connection *connection)
   }
 
   free(connection);
+  stats.active_connection--;
 }
 
 static void disconnect_cb(struct evhttp_connection *conn, void *arg)
@@ -96,6 +65,41 @@ static void disconnect_cb(struct evhttp_connection *conn, void *arg)
   close(connection);
 }
 
+static void stat_handler(struct evhttp_request *req, void *arg)
+{
+  const char *ruri = evhttp_request_get_uri(req);
+
+  if (verbose)
+    fprintf(stderr, "new status request URI '%s'\n", ruri);
+
+  if (check_ip(req->remote_host) == 0) {
+    fprintf(stderr, "not allowed '%s:%d'\n", req->remote_host, req->remote_port);
+
+    evhttp_add_header(req->output_headers, "Connection", "Close");
+    evhttp_send_reply(req, HTTP_FORBIDDEN, "Forbidden", NULL);
+    stats.forbidden++;
+    return;
+  }
+  
+  struct evbuffer *buf;
+
+  evhttp_add_header(req->output_headers, "Content-Type", "text/json; charset=utf-8");
+  evhttp_add_header(req->output_headers, "Access-Control-Allow-Origin", "*");
+  evhttp_add_header(req->output_headers, "Access-Control-Allow-Methods", "GET,POST");
+
+  buf = evbuffer_new();
+  evbuffer_add_printf(buf, "{publication: %" PRIu64 ",", stats.publication);
+  evbuffer_add_printf(buf, "notification: %" PRIu64 ",", stats.notification);
+  evbuffer_add_printf(buf, "connection: %" PRIu64 ",", stats.connection);
+  evbuffer_add_printf(buf, "active_connection: %" PRIu64 ",", stats.active_connection);
+  evbuffer_add_printf(buf, "invalid_method: %" PRIu64 ",", stats.invalid_method);
+  evbuffer_add_printf(buf, "invalid_request: %" PRIu64 ",", stats.invalid_request);
+  evbuffer_add_printf(buf, "unknown_request: %" PRIu64 ",", stats.unknown_request);
+  evbuffer_add_printf(buf, "forbidden: %" PRIu64 "}", stats.forbidden);
+  evhttp_send_reply(req, HTTP_OK, "OK", buf);
+  evbuffer_free(buf);
+}
+
 static void pub_handler(struct evhttp_request *req, void *arg)
 {
   const char *ruri = evhttp_request_get_uri(req);
@@ -103,11 +107,23 @@ static void pub_handler(struct evhttp_request *req, void *arg)
   if (verbose)
     fprintf(stderr, "new pub request URI '%s'\n", ruri);
 
-  if (evhttp_request_get_command(req) != EVHTTP_REQ_GET) {
-    evhttp_send_reply(req, HTTP_BADMETHOD, "Invalid Method", NULL);
+  if (check_ip(req->remote_host) == 0) {
+    fprintf(stderr, "not allowed '%s:%d'\n", req->remote_host, req->remote_port);
+
+    evhttp_add_header(req->output_headers, "Connection", "Close");
+    evhttp_send_reply(req, HTTP_FORBIDDEN, "Forbidden", NULL);
+    stats.forbidden++;
     return;
   }
 
+  if (evhttp_request_get_command(req) != EVHTTP_REQ_GET) {
+    fprintf(stderr, "invalide method '%s:%d'\n", req->remote_host, req->remote_port);
+
+    evhttp_send_reply(req, HTTP_BADMETHOD, "Invalid Method", NULL);
+    stats.invalid_method++;
+    return;
+  }
+  
   struct evbuffer *buf;
 
   struct evkeyvalq params;
@@ -118,6 +134,7 @@ static void pub_handler(struct evhttp_request *req, void *arg)
     evhttp_send_reply(req, HTTP_BADREQUEST, "Invalid Request", NULL);
 
     evhttp_clear_headers(&params);
+    stats.invalid_request++;
     return;
   }
 
@@ -156,6 +173,7 @@ static void pub_handler(struct evhttp_request *req, void *arg)
     evbuffer_free(buf);
 
     close(connection);
+    stats.notification++;
   }
 
   evhttp_add_header(req->output_headers, "Content-Type", "text/json; charset=utf-8");
@@ -168,6 +186,7 @@ static void pub_handler(struct evhttp_request *req, void *arg)
   evbuffer_free(buf);
 
   evhttp_clear_headers(&params);
+  stats.publication++;
 }
 
 static void sub_handler(struct evhttp_request *req, void *arg)
@@ -179,6 +198,7 @@ static void sub_handler(struct evhttp_request *req, void *arg)
 
   if (evhttp_request_get_command(req) != EVHTTP_REQ_GET) {
     evhttp_send_reply(req, HTTP_BADMETHOD, "Invalid Method", NULL);
+    stats.invalid_method++;
     return;
   }
 
@@ -188,6 +208,7 @@ static void sub_handler(struct evhttp_request *req, void *arg)
   const char *name = get_str(&params, "channel", NULL);
   if (name == NULL || strlen(name) == 0) {
     evhttp_send_reply(req, HTTP_BADREQUEST, "Invalid Request", NULL);
+    stats.invalid_request++;
     return;
   }
 
@@ -225,6 +246,9 @@ static void sub_handler(struct evhttp_request *req, void *arg)
 
   if (verbose)
     fprintf(stderr, "connected %p\n", connection->req->evcon);
+
+  stats.active_connection++;
+  stats.connection++;
 }
 
 static void gen_handler(struct evhttp_request *req, void *arg)
@@ -235,12 +259,13 @@ static void gen_handler(struct evhttp_request *req, void *arg)
     fprintf(stderr, "unrecognized request URI '%s', sending 404\n", ruri);
 
   evhttp_send_reply(req, HTTP_BADREQUEST, "Bad Request", NULL);
+  stats.unknown_request++;
 }
 
 static void sigint_cb(evutil_socket_t sig, short events, void *ptr)
 {
   struct event_base *base = (event_base *)ptr;
-  struct timeval delay = { 0, 0 };
+  struct timeval delay = { 1, 0 };
  
   printf("Interrupted exiting...\n");
   event_base_loopexit(base, &delay);
@@ -248,7 +273,7 @@ static void sigint_cb(evutil_socket_t sig, short events, void *ptr)
 
 static void sighup_cb(evutil_socket_t sig, short events, void *ptr)
 {
-  printf("HUP\n");
+  // TODO
 }
 
 int main (int argc, char *argv[])
@@ -258,9 +283,12 @@ int main (int argc, char *argv[])
   struct event_base *base;
   struct evhttp *server;
   struct event *sigint_event, *sighup_event;
+  int is_iplist = 0;
+
+  TAILQ_INIT(&ips);
 
   int c;
-  while ((c = getopt (argc, argv, "vha:p:")) != -1) {
+  while ((c = getopt (argc, argv, "vha:p:i:")) != -1) {
     switch (c) {
       case 'v':
         verbose = 1;
@@ -271,11 +299,19 @@ int main (int argc, char *argv[])
       case 'p':
         port = atoi(optarg);
         break;
+      case 'i':
+        parse_ips(optarg);
+        is_iplist = 1;
+        break;
       case 'h':
       default:
-        fprintf(stderr, "usage: %s [-v] [-a 0.0.0.0] [-p 8080]\n", argv[0]);
+        fprintf(stderr, "usage: %s [-v] [-a 0.0.0.0] [-p 8080] [-i all]\n", argv[0]);
         exit(1);
     }
+  }
+
+  if (!is_iplist) {
+    parse_ips(NULL);
   }
 
   TAILQ_INIT(&channels);
@@ -304,15 +340,13 @@ int main (int argc, char *argv[])
 
   evhttp_set_cb(server, "/pub", pub_handler, NULL);
   evhttp_set_cb(server, "/sub", sub_handler, NULL);
+  evhttp_set_cb(server, "/stat", stat_handler, NULL);
   evhttp_set_gencb(server, gen_handler, NULL);
 
   handle = evhttp_bind_socket_with_handle(server, address, port);
 
-  if (verbose)
-    fprintf(stderr, "Server bound to %s:%d\n", address, port);
-
-  if (verbose)
-    fprintf(stderr, "Entering dispatching loop, server started\n");
+  fprintf(stderr, "Server bound to %s:%d\n", address, port);
+  fprintf(stderr, "Entering dispatching loop, server started\n");
 
   event_base_dispatch(base);
 
@@ -322,4 +356,69 @@ int main (int argc, char *argv[])
   event_base_free(base);
 
   return 0;
+}
+
+void parse_ips(char *iplist)
+{
+  char *token;
+  struct in_addr ip_addr;
+  struct ip *ip;
+  int parsed = 0;
+  
+  token = strtok(iplist, ",");
+  while( token != NULL ) 
+  {
+    if (strcmp(token, "all") == 0) {
+      ip = (struct ip *) calloc(1, sizeof *ip);
+      ip->ip = 0;
+      TAILQ_INSERT_TAIL(&ips, ip, next);
+    } else if (inet_aton(token, &ip_addr) != 0) {
+      ip = (struct ip *) calloc(1, sizeof *ip);
+      ip->ip = ip_addr.s_addr;
+      TAILQ_INSERT_TAIL(&ips, ip, next);
+    } else {
+      printf("Uknkown ip definition: %s\n", token);
+    }
+    token = strtok(NULL, ",");
+  }
+
+  // fall back to add all
+  if (TAILQ_EMPTY(&ips)) {
+      ip = (struct ip *) calloc(1, sizeof *ip);
+      ip->ip = 0;
+      TAILQ_INSERT_TAIL(&ips, ip, next);
+  }
+}
+
+int check_ip(const char *address)
+{
+  struct in_addr ip_addr;
+  
+  if (inet_aton(address, &ip_addr) == 0) {
+    fprintf(stderr, "Unknown ip address format '%s'\n", address);
+    return 0;
+  }
+
+  struct ip *ip;
+  TAILQ_FOREACH(ip, &ips, next) {
+    if (ip->ip == 0) {
+      return 1;
+    } else if (ip->ip == ip_addr.s_addr) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+int get_int(struct evkeyvalq *params, const char *name, int def)
+{
+  const char *val = evhttp_find_header(params, name);
+  return val ? atoi(val) : def;
+}
+
+const char* get_str(struct evkeyvalq *params, const char *name, const char *def)
+{
+  const char *val = evhttp_find_header(params, name);
+  return val ? val : def;
 }
