@@ -1,8 +1,9 @@
 #include <stdint.h>
 #include <sys/queue.h>
-#include <inttypes.h>
 
 #define __STDC_FORMAT_MACROS
+#include <inttypes.h>
+
 #define HTTP_FORBIDDEN 403
 
 struct channel;
